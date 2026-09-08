@@ -351,10 +351,12 @@
       <div class="stat-row"><span class="k">Person detected</span><span class="v" id="personState">—</span></div>
 
       <div class="quality-box">
-        <h3>ID photo review</h3>
+        <h3>ID photo review <span style="font-weight:400; text-transform:none; letter-spacing:0; color:#8a7a72;">(AI-suggested, please confirm)</span></h3>
         <label><input type="checkbox" id="faceCheck" /> Face is centered inside the guide</label>
         <label><input type="checkbox" id="lightingCheck" /> Face is clear and evenly lit</label>
         <label><input type="checkbox" id="shouldersCheck" /> Head and shoulders are fully visible</label>
+        <div id="qualityNote" style="margin-top:9px; font-size:11.5px; color:#5f6577; line-height:1.5;"></div>
+        <div id="checklistHint" style="margin-top:6px; font-size:11px; color:#8a7a72; font-family:'IBM Plex Mono', monospace;">Check all three to enable download</div>
       </div>
 
       <div class="actions">
@@ -394,6 +396,11 @@ const personStateEl = document.getElementById('personState');
 const originalLabel = document.getElementById('originalLabel');
 const toggleMaskBtn = document.getElementById('toggleMaskBtn');
 const downloadCardBtn = document.getElementById('downloadCardBtn');
+const faceCheck = document.getElementById('faceCheck');
+const lightingCheck = document.getElementById('lightingCheck');
+const shouldersCheck = document.getElementById('shouldersCheck');
+const checklistHint = document.getElementById('checklistHint');
+const qualityNote = document.getElementById('qualityNote');
 
 let segmenter = null;
 let resultDataUrl = null;
@@ -411,6 +418,8 @@ const startCameraBtn = document.getElementById('startCameraBtn');
 const captureBtn = document.getElementById('captureBtn');
 const cameraHint = document.getElementById('cameraHint');
 let liveLoopActive = false;
+let lastLiveCutout = null;
+let lastLiveDims = null;
 
 dropzone.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', handleFile);
@@ -419,6 +428,9 @@ resetBtn.addEventListener('click', resetAll);
 downloadBtn.addEventListener('click', downloadResult);
 downloadCardBtn.addEventListener('click', downloadCardPreview);
 toggleMaskBtn.addEventListener('click', toggleMaskPreview);
+[faceCheck, lightingCheck, shouldersCheck].forEach(box => {
+  box.addEventListener('change', updateDownloadGating);
+});
 uploadModeBtn.addEventListener('click', () => switchMode('upload'));
 cameraModeBtn.addEventListener('click', () => switchMode('camera'));
 startCameraBtn.addEventListener('click', startCamera);
@@ -474,6 +486,8 @@ async function liveFrameLoop(){
 
       if(segmented){
         maskDataUrl = segmented.maskCanvas.toDataURL('image/png');
+        lastLiveCutout = segmented.cutoutCanvas;
+        lastLiveDims = { w, h };
         paintWhiteResult(liveCanvas, segmented.cutoutCanvas, w, h, true);
         if(liveCanvas.style.display !== 'block'){
           liveCanvas.style.display = 'block';
@@ -515,8 +529,10 @@ function capturePhoto(){
   maskImg.style.display = 'none';
   if(maskDataUrl) maskImg.src = maskDataUrl;
   slotPlaceholder.style.display = 'none';
-  downloadBtn.disabled = false;
-  downloadCardBtn.disabled = false;
+  const assessment = (lastLiveCutout && lastLiveDims)
+    ? assessPhotoQuality(lastLiveCutout, lastLiveDims.w, lastLiveDims.h)
+    : null;
+  applyQualitySuggestions(assessment);
   toggleMaskBtn.disabled = !maskDataUrl;
   toggleMaskBtn.textContent = 'Show AI mask';
   bgStateEl.textContent = 'White';
@@ -606,6 +622,63 @@ async function segmentToCutout(sourceEl, w, h){
   return { cutoutCanvas, maskCanvas };
 }
 
+// Reads the cutout's alpha channel to estimate where the person sits in the
+// frame and how bright they are, then turns that into three yes/no suggestions
+// matching the manual review checklist. This is a heuristic, not a guarantee —
+// the checkboxes stay editable so the user has the final say.
+function assessPhotoQuality(cutoutCanvas, w, h){
+  const data = cutoutCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+  let minX = w, maxX = 0, minY = h, maxY = 0;
+  let sumLum = 0, count = 0;
+  const stride = 2; // sample every other pixel in each direction — plenty for a coarse estimate, much faster
+
+  for(let y = 0; y < h; y += stride){
+    for(let x = 0; x < w; x += stride){
+      const i = (y * w + x) * 4;
+      if(data[i + 3] > 40){
+        if(x < minX) minX = x;
+        if(x > maxX) maxX = x;
+        if(y < minY) minY = y;
+        if(y > maxY) maxY = y;
+        sumLum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+        count++;
+      }
+    }
+  }
+  if(count === 0) return null;
+
+  const avgLum = sumLum / count;
+  const bboxW = maxX - minX;
+  const centerX = (minX + maxX) / 2;
+
+  const centered = Math.abs(centerX / w - 0.5) < 0.18 && (bboxW / w) > 0.12;
+  const lighting = avgLum > 65;
+  const framing = (minY / h) > 0.01 && (minX / w) > 0.02 && ((w - maxX) / w) > 0.02;
+
+  return { centered, lighting, framing, avgLum };
+}
+
+function applyQualitySuggestions(assessment){
+  if(!assessment){
+    qualityNote.textContent = '';
+    return;
+  }
+  faceCheck.checked = assessment.centered;
+  lightingCheck.checked = assessment.lighting;
+  shouldersCheck.checked = assessment.framing;
+
+  const issues = [];
+  if(!assessment.centered) issues.push('face may not be centered in frame');
+  if(!assessment.lighting) issues.push('lighting looks a bit dim');
+  if(!assessment.framing) issues.push('framing may be cutting off part of you');
+
+  qualityNote.textContent = issues.length === 0
+    ? 'AI check: looks good on all three — please confirm before downloading.'
+    : 'AI check found: ' + issues.join('; ') + '. Review and adjust the boxes above.';
+
+  updateDownloadGating();
+}
+
 function paintWhiteResult(targetCanvas, cutoutCanvas, w, h, mirror){
   targetCanvas.width = w; targetCanvas.height = h;
   const ctx = targetCanvas.getContext('2d');
@@ -647,8 +720,7 @@ async function processPhoto(){
     maskImg.src = maskDataUrl;
     maskImg.style.display = 'none';
     slotPlaceholder.style.display = 'none';
-    downloadBtn.disabled = false;
-    downloadCardBtn.disabled = false;
+    applyQualitySuggestions(assessPhotoQuality(segmented.cutoutCanvas, w, h));
     toggleMaskBtn.disabled = false;
     toggleMaskBtn.textContent = 'Show AI mask';
     bgStateEl.textContent = 'White';
@@ -688,6 +760,22 @@ function clearReviewChecklist(){
   document.querySelectorAll('.quality-box input[type="checkbox"]').forEach(box => {
     box.checked = false;
   });
+  qualityNote.textContent = '';
+  updateDownloadGating();
+}
+
+function updateDownloadGating(){
+  const allChecked = faceCheck.checked && lightingCheck.checked && shouldersCheck.checked;
+  const hasResult = !!resultDataUrl;
+  downloadBtn.disabled = !(hasResult && allChecked);
+  downloadCardBtn.disabled = !(hasResult && allChecked);
+  if(!hasResult){
+    checklistHint.textContent = 'Process a photo first';
+  }else if(!allChecked){
+    checklistHint.textContent = 'Check all three to enable download';
+  }else{
+    checklistHint.textContent = 'Ready to download';
+  }
 }
 
 function loadCanvasImage(src){
@@ -796,6 +884,8 @@ function resetAll(){
   clearReviewChecklist();
   slotPlaceholder.style.display = 'block';
   resultDataUrl = null;
+  lastLiveCutout = null;
+  lastLiveDims = null;
   statusEl.textContent = 'Waiting for a photo…';
   bgStateEl.textContent = '—';
   personStateEl.textContent = '—';
